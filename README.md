@@ -355,7 +355,154 @@ primary_tags.stage = "production"
 
 ---
 
-### 4. DQL Querying
+### 4. Quarantine Bucket Pattern — Handling Missing Enrichment Fields
+
+Instead of silently dropping or misrouting records that arrive without required enrichment fields (e.g. `dt.security_context` is missing), route them to a **quarantine bucket** and emit a **counter metric** so the gap is visible and alertable.
+
+This pattern preserves data, makes enrichment gaps observable, and avoids silent data loss.
+
+#### Architecture
+
+```
+Incoming records
+      │
+      ▼
+Dynamic Routing rule
+      │
+      ├─ has dt.security_context? ──► YES → normal pipeline → correct bucket
+      │
+      └─ NOT exists(dt.security_context) ──► quarantine pipeline
+                                                    │
+                                                    ├─ Counter Metric extraction
+                                                    │   └─ metric: log.enrichment.quarantine.count
+                                                    │   └─ dimension: k8s.namespace.name (or host.name)
+                                                    │
+                                                    └─ Storage: quarantine bucket
+```
+
+#### Step 1: Create the Quarantine Bucket
+
+In **Grail → Buckets**, create a dedicated bucket:
+
+| Setting | Value |
+|---------|-------|
+| **Name** | `logs-quarantine` |
+| **Retention** | 35 days (short — quarantine is temporary) |
+| **Purpose** | Hold records missing required enrichment fields |
+
+---
+
+#### Step 2: Create the Quarantine Pipeline
+
+In **OpenPipeline → Logs → Pipelines**, create a new pipeline named `Quarantine — Missing Enrichment`.
+
+**Add Processor 1 — Counter Metric Extraction:**
+
+| Setting | Value |
+|---------|-------|
+| **Processor type** | Counter metric |
+| **Name** | `Count quarantined records` |
+| **Matching condition** | *(leave empty — applies to all records entering this pipeline)* |
+| **Metric key** | `log.enrichment.quarantine.count` |
+| **Dimension** | `k8s.namespace.name` *(or `dt.host_group.id`, `host.name` — whatever identifies the source)* |
+
+This emits one count per quarantined record, split by the dimension you choose — so you can see exactly which namespace or host group is producing unenriched records.
+
+**Storage stage — assign to quarantine bucket:**
+
+In the pipeline's **Storage** stage, set the target bucket to `logs-quarantine`.
+
+---
+
+#### Step 3: Add the Dynamic Routing Rule
+
+In **OpenPipeline → Logs → Dynamic Routing**, add a new route **before** your normal routing rules:
+
+| Setting | Value |
+|---------|-------|
+| **Name** | `Quarantine — missing dt.security_context` |
+| **Matching condition** | `not exists(dt.security_context)` |
+| **Target pipeline** | `Quarantine — Missing Enrichment` |
+
+> **Order matters.** Place this rule at the end of your routing list so records with valid enrichment are matched first by their correct routes. The quarantine rule acts as a catch-all fallback.
+
+To check for multiple missing fields, combine conditions:
+
+```
+not exists(dt.security_context) or not exists(primary_tags.team)
+```
+
+---
+
+#### Step 4: Query Quarantined Records
+
+To inspect what was quarantined and why:
+
+```dql
+fetch logs, from: now()-24h
+| filter matchesBucket("logs-quarantine")
+| summarize count(), by: {k8s.namespace.name, host.name, dt.host_group.id}
+| sort count() desc
+```
+
+To find the specific records:
+
+```dql
+fetch logs, from: now()-24h
+| filter matchesBucket("logs-quarantine")
+| fields timestamp, content, k8s.namespace.name, host.name, service.name
+| limit 100
+```
+
+---
+
+#### Step 5: Alert on the Quarantine Metric
+
+Set up a **metric-based alert** so your team is notified when records start being quarantined.
+
+**Option A — Davis Anomaly Detector (recommended):**
+
+In **Settings → Anomaly detection → Custom metrics**, create a detector on `log.enrichment.quarantine.count`. Davis will learn the baseline and alert on unexpected spikes.
+
+**Option B — Static threshold alert:**
+
+In **Settings → Anomaly detection → Custom metrics**, set a static threshold:
+
+```
+Condition: log.enrichment.quarantine.count > 0
+Window: 5 minutes
+Severity: Warning
+```
+
+**Option C — Workflow trigger:**
+
+Create a Workflow triggered by the metric event to send a notification (Slack, email, ticket) with context:
+
+```javascript
+// Workflow action — fetch context from quarantine bucket
+const result = await fetch({
+  query: `fetch logs, from: now()-15m
+          | filter matchesBucket("logs-quarantine")
+          | summarize count(), by: {k8s.namespace.name}
+          | sort count() desc
+          | limit 5`
+});
+```
+
+---
+
+#### Quarantine Checklist
+
+- [ ] `logs-quarantine` bucket created with short retention
+- [ ] `Quarantine — Missing Enrichment` pipeline created
+- [ ] Counter metric `log.enrichment.quarantine.count` configured with a source dimension
+- [ ] Dynamic routing rule `not exists(dt.security_context)` added as last fallback route
+- [ ] Alert or workflow configured on the quarantine metric
+- [ ] DQL query saved in a Notebook for investigation
+
+---
+
+### 5. DQL Querying
 
 Query using `primary_tags.*` fields the same way you query any other field:
 
@@ -458,6 +605,11 @@ The Service Graph Connector v2 syncs Smartscape entities using Classic Tags and 
 
 ---
 
+### 10. Dynamic routing rule order matters for the quarantine pattern
+The quarantine catch-all rule (`not exists(dt.security_context)`) must be placed **last** in the routing list. If it is placed first, all records — including correctly enriched ones — will be evaluated against it, and any record that happens to match will be quarantined before reaching its correct route.
+
+---
+
 ## Enrichment Checklist — Per Technology
 
 ### Kubernetes
@@ -483,6 +635,12 @@ The Service Graph Connector v2 syncs Smartscape entities using Classic Tags and 
 - [ ] Resource attributes include `dt.security_context`
 - [ ] Resource attributes include `dt.cost.costcenter` and `dt.cost.product`
 - [ ] Resource attributes include `primary_tags.*` fields per convention
+
+### Quarantine Pattern
+- [ ] `logs-quarantine` bucket created with short retention
+- [ ] `Quarantine — Missing Enrichment` pipeline created with counter metric
+- [ ] Dynamic routing rule added as last fallback
+- [ ] Alert or workflow configured on `log.enrichment.quarantine.count`
 
 ---
 
@@ -531,6 +689,8 @@ primary_tags.app   = easytravel | hipstershop | easytrade
 | K8s metadata & telemetry enrichment | [docs.dynatrace.com](https://docs.dynatrace.com/docs/ingest-from/setup-on-k8s/guides/metadata-automation/k8s-metadata-telemetry-enrichment) |
 | Configure advanced permissions (security context) | [docs.dynatrace.com](https://docs.dynatrace.com/docs/platform/grail/organize-data/advanced-permission-setup) |
 | Segments upgrade guide (MZ → Segments) | [docs.dynatrace.com](https://docs.dynatrace.com/docs/manage/segments/upgrade-guide-segments) |
+| OpenPipeline — configure a processing pipeline | [docs.dynatrace.com](https://docs.dynatrace.com/docs/platform/openpipeline/get-started/tutorial-configure-processing) |
+| OpenPipeline — extract a metric from log lines | [docs.dynatrace.com](https://docs.dynatrace.com/docs/platform/openpipeline/use-cases/tutorial-log-processing-pipeline) |
 | D1COE — Metadata Enrichment | [Confluence](https://dt-rnd.atlassian.net/wiki/spaces/d1coe/pages/1246757730) |
 | D1COE — Enrichment: Kubernetes | [Confluence](https://dt-rnd.atlassian.net/wiki/spaces/d1coe/pages/1229849653) |
 | D1COE — Enrichment: OneAgent | [Confluence](https://dt-rnd.atlassian.net/wiki/spaces/d1coe/pages/1373569857) |
